@@ -1,3 +1,39 @@
+"""
+Copyright 2021 JaidedAI
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+The MIT License (MIT)
+
+Copyright (c) 2021 NVIDIA CORPORATION
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+"""
 from PIL import Image
 import torch
 import torch.backends.cudnn as cudnn
@@ -9,7 +45,9 @@ from collections import OrderedDict
 import importlib
 from .utils import CTCLabelConverter
 import math
-from torch2trt import torch2trt
+from torch2trt import torch2trt,TRTModule
+import os
+import time
 
 
 def custom_mean(x):
@@ -100,6 +138,7 @@ class AlignCollate(object):
 
 def recognizer_predict(model, converter, test_loader, batch_max_length,\
                        ignore_idx, char_group_idx, decoder = 'greedy', beamWidth= 5, device = 'cpu'):
+    t_rec_start = time.time()
     model.eval()
     result = []
     with torch.no_grad():
@@ -113,9 +152,15 @@ def recognizer_predict(model, converter, test_loader, batch_max_length,\
             #ak
 #             model = torch2trt(model,[image])#, use_onnx=True)
 #             print("CONVERTED RECOGNIZER TO TRT!")
-            
+            #print("Loading TRT recognizer")
+            # model_trt = TRTModule()
+            # model_trt.load_state_dict(torch.load('recognizer_trt.pth'))
+
             preds = model(image, text_for_pred)
-            
+
+            # print("Predict Testing TRT Model Difference:")
+            # preds_trt = model_trt(image)
+            # print(torch.max(torch.abs(preds_trt - preds)))
 
             # Select max probabilty (greedy decoding) then decode index to character
             preds_size = torch.IntTensor([preds.size(1)] * batch_size)
@@ -154,12 +199,13 @@ def recognizer_predict(model, converter, test_loader, batch_max_length,\
             for pred, pred_max_prob in zip(preds_str, preds_max_prob):
                 confidence_score = custom_mean(pred_max_prob)
                 result.append([pred, confidence_score])
-
+    t_rec_end = time.time()
+    #print("rec_time",t_rec_end-t_rec_start)
     return result
 
 def get_recognizer(recog_network, network_params, character,\
                    separator_list, dict_list, model_path,\
-                   device = 'cpu', quantize = True):
+                   device = 'cpu', quantize = True, use_trt = False):
 
     converter = CTCLabelConverter(character, separator_list, dict_list)
     num_class = len(converter.character)
@@ -193,8 +239,25 @@ def get_recognizer(recog_network, network_params, character,\
 #         print("CONVERTED RECOGNIZER TO TRT!")
         
         model = torch.nn.DataParallel(model).to(device)
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        
+        model.load_state_dict(torch.load(model_path, map_location=device)) #model path is /root/.EasyOCR//model/english_g2.pth'
+
+    
+    # if use_trt:
+    #     sample_input = torch.randn((1,1,64,896),dtype=torch.float).cuda()
+    #     model.eval()
+    #     if os.path.isfile('recognizer_trt.pth'):
+    #         print("Loading TRT recognizer")
+    #         model_trt = TRTModule()
+    #         model_trt.load_state_dict(torch.load('recognizer_trt.pth'))
+    #     else:
+    #         print("Converting recognizer to TRT")
+    #         model_trt = torch2trt(model,[sample_input])
+    #         torch.save(model_trt.state_dict(),'recognizer_trt.pth')
+    #     print("Testing TRT Model Difference:")
+    #     sample_input = torch.randn((1,1,64,896),dtype=torch.float).cuda()
+    #     print(torch.max(torch.abs(model_trt(sample_input) - model(sample_input))))
+    #     model = model_trt
+
     return model, converter
 
 def get_text(character, imgH, imgW, recognizer, converter, image_list,\
@@ -220,7 +283,7 @@ def get_text(character, imgH, imgW, recognizer, converter, image_list,\
     result1 = recognizer_predict(recognizer, converter, test_loader,batch_max_length,\
                                  ignore_idx, char_group_idx, decoder, beamWidth, device = device)
 
-    # predict second round
+    # predict second round - only runs second round if result confidence (item[1]) is less than contrast_ths(.1)
     low_confident_idx = [i for i,item in enumerate(result1) if (item[1] < contrast_ths)]
     if len(low_confident_idx) > 0:
         img_list2 = [img_list[i] for i in low_confident_idx]

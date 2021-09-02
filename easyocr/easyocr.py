@@ -1,3 +1,39 @@
+"""
+Copyright 2021 JaidedAI
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+The MIT License (MIT)
+
+Copyright (c) 2021 NVIDIA CORPORATION
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+"""
 # -*- coding: utf-8 -*-
 
 from .detection import get_detector, get_textbox
@@ -16,6 +52,7 @@ import sys
 from PIL import Image
 from logging import getLogger
 import yaml
+import time
 
 if sys.version_info[0] == 2:
     from io import open
@@ -27,12 +64,32 @@ else:
 
 LOGGER = getLogger(__name__)
 
+#torch2trt custom converters. 
+# gives error, module 'max' not callable when this code uses the max() functin: TypeError: 'module' object is not callable
+# 
+# from torch2trt import *
+# @tensorrt_converter('torch.Tensor.__hash__')
+# @tensorrt_converter('torch.Tensor.get_device')
+# @tensorrt_converter('torch.Tensor.data_ptr')
+# @tensorrt_converter('torch.Tensor.is_complex')
+# @tensorrt_converter('torch.is_grad_enabled')
+# def suppress_warning(ctx):
+#     #none of these effect the computational path thus don't need converters
+#     pass
+
+# @tensorrt_converter('torch.zeros')
+# def convert_add(ctx):
+#     input_a = ctx.method_args[0]
+#     output = ctx.method_return
+#     output._trt = add_missing_trt_tensors(ctx.network, [output])
+
+
 class Reader(object):
 
     def __init__(self, lang_list, gpu=True, model_storage_directory=None,
                  user_network_directory=None, recog_network = 'standard',
                  download_enabled=True, detector=True, recognizer=True,
-                 verbose=True, quantize=True, cudnn_benchmark=False):
+                 verbose=True, quantize=True, cudnn_benchmark=False, use_trt=False):
         """Create an EasyOCR Reader.
 
         Parameters:
@@ -216,7 +273,8 @@ class Reader(object):
             dict_list[lang] = os.path.join(BASE_PATH, 'dict', lang + ".txt")
 
         if detector:
-            self.detector = get_detector(detector_path, self.device, quantize, cudnn_benchmark=cudnn_benchmark)
+            self.detector = get_detector(detector_path, self.device, quantize, cudnn_benchmark=cudnn_benchmark, use_trt=use_trt)
+            self.detector_EAST = None
         if recognizer:
             if recog_network == 'generation1':
                 network_params = {
@@ -234,7 +292,7 @@ class Reader(object):
                 network_params = recog_config['network_params']
             self.recognizer, self.converter = get_recognizer(recog_network, network_params,\
                                                          self.character, separator_list,\
-                                                         dict_list, model_path, device = self.device, quantize=quantize)
+                                                         dict_list, model_path, device = self.device, quantize=quantize, use_trt=use_trt)
 
     def setModelLanguage(self, language, lang_list, list_lang, list_lang_string):
         self.model_lang = language
@@ -268,7 +326,7 @@ class Reader(object):
                link_threshold = 0.4,canvas_size = 2560, mag_ratio = 1.,\
                slope_ths = 0.1, ycenter_ths = 0.5, height_ths = 0.5,\
                width_ths = 0.5, add_margin = 0.1, reformat=True, optimal_num_chars=None):
-
+    #    t_totaldet1 = time.time()
         if reformat:
             img, img_cv_grey = reformat_input(img)
 
@@ -276,12 +334,20 @@ class Reader(object):
                                     text_threshold, link_threshold, low_text,
                                     False, self.device, optimal_num_chars)
 
+        #uncomment the code below to have the model use EAST detection instead of CRAFT
+        # if self.detect_EAST is None:
+        #     self.detect_EAST = get_EAST()
+        # else:
+        #     text_box_list = get_textbox_EAST(model)
+
+
         horizontal_list_agg, free_list_agg = [], []
         for text_box in text_box_list:
+            #horizontal list is boxes, i think free_list is freeform polygons, if you call get_textbox with poly=True, and an image with diagonal/circular text i think you might see something in free_list
             horizontal_list, free_list = group_text_box(text_box, slope_ths,
                                                         ycenter_ths, height_ths,
                                                         width_ths, add_margin,
-                                                        (optimal_num_chars is None))
+                                                        (optimal_num_chars is None)) #groups character level boxes into words
             if min_size:
                 horizontal_list = [i for i in horizontal_list if max(
                     i[1] - i[0], i[3] - i[2]) > min_size]
@@ -289,7 +355,8 @@ class Reader(object):
                     diff([c[0] for c in i]), diff([c[1] for c in i])) > min_size]
             horizontal_list_agg.append(horizontal_list)
             free_list_agg.append(free_list)
-
+    #    t_totaldet2 = time.time()
+    #    print("Total detection time", t_totaldet2-t_totaldet1)
         return horizontal_list_agg, free_list_agg
 
     def recognize(self, img_cv_grey, horizontal_list=None, free_list=None,\
@@ -298,7 +365,7 @@ class Reader(object):
                   rotation_info = None,paragraph = False,\
                   contrast_ths = 0.1,adjust_contrast = 0.5, filter_ths = 0.003,\
                   y_ths = 0.5, x_ths = 1.0, reformat=True, output_format='standard'):
-
+    #    t_totalrec1 = time.time()
         if reformat:
             img, img_cv_grey = reformat_input(img_cv_grey)
 
@@ -319,7 +386,7 @@ class Reader(object):
         # without gpu/parallelization, it is faster to process image one by one
         if ((batch_size == 1) or (self.device == 'cpu')) and not rotation_info:
             result = []
-            for bbox in horizontal_list:
+            for bbox in horizontal_list: #bbox is [xmin,xmax,ymin,ymax]
                 h_list = [bbox]
                 f_list = []
                 image_list, max_width = get_image_list(h_list, f_list, img_cv_grey, model_height = imgH)
@@ -360,6 +427,9 @@ class Reader(object):
 
         if paragraph:
             result = get_paragraph(result, x_ths=x_ths, y_ths=y_ths, mode = direction_mode)
+
+    #    t_totalrec2 = time.time()
+    #    print("Total Recogntion time", t_totalrec2-t_totalrec1)
 
         if detail == 0:
             return [item[1] for item in result]
